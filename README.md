@@ -1,4 +1,5 @@
 <div align="center">
+[![Soak](https://github.com/purvask2006-collab/kerno_Purva_GSSoC/actions/workflows/soak.yml/badge.svg)](https://github.com/purvask2006-collab/kerno_Purva_GSSoC/actions/workflows/soak.yml)
 
 # KERNO
 

@@ -1,0 +1,195 @@
+# .github/workflows/soak.yml
+#
+# 24-hour nightly soak test for kerno
+# ------------------------------------
+# Runs kerno under continuous chaos load, samples RSS / goroutines / FDs /
+# BPF maps / Prometheus throughput every 5 minutes, asserts pass criteria
+# at the end, and uploads the full evidence bundle as a GitHub Actions artifact.
+#
+# Scheduled:  02:00 UTC every night
+# Manual:     workflow_dispatch (accepts DURATION_SECONDS override)
+# Free-tier:  one ubuntu-22.04 runner × 24 h ≈ 1 440 min.
+#             GitHub's free tier gives 2 000 min/month → fits one nightly run.
+
+name: "Soak — 24 h leak & stability test"
+
+on:
+  schedule:
+    - cron: "0 2 * * *"   # 02:00 UTC nightly
+  workflow_dispatch:
+    inputs:
+      duration_seconds:
+        description: "Soak duration in seconds (default 86400 = 24 h)"
+        required: false
+        default: "86400"
+      interval_seconds:
+        description: "Scrape interval in seconds (default 300 = 5 min)"
+        required: false
+        default: "300"
+
+env:
+  # ── tunables ──────────────────────────────────────────────────────────────
+  DURATION:   ${{ github.event.inputs.duration_seconds || '86400' }}
+  INTERVAL:   ${{ github.event.inputs.interval_seconds || '300' }}
+  PPROF_PORT: 6060
+  METRICS_PORT: 9091
+  KERNO_LOG:  /tmp/kerno.log
+  CHAOS_LOG:  /tmp/chaos.log
+  SOAK_DIR:   /tmp/soak
+
+jobs:
+  soak:
+    name: "24 h soak test"
+    runs-on: ubuntu-22.04
+    timeout-minutes: 1500   # 25 h hard cap — gives 1 h of assertion headroom
+
+    steps:
+      # ── 0. checkout ────────────────────────────────────────────────────────
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      # ── 1. toolchain ────────────────────────────────────────────────────────
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: "go.mod"
+          cache: true
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends \
+            linux-tools-common \
+            linux-tools-$(uname -r) \
+            bpftool \
+            libcap2-bin \
+            python3 \
+            python3-pip
+          pip3 install --quiet pandas
+
+      # ── 2. build ─────────────────────────────────────────────────────────
+      - name: Build kerno
+        run: |
+          make build
+          # Verify the binary exists
+          ls -lh ./kerno
+
+      - name: Grant BPF capabilities (no sudo required at runtime)
+        run: |
+          sudo setcap cap_bpf,cap_sys_admin,cap_net_admin+eip ./kerno
+
+      # ── 3. prepare soak directory ─────────────────────────────────────────
+      - name: Create soak workspace
+        run: |
+          mkdir -p "$SOAK_DIR/pprof"
+          # Write CSV header
+          echo "timestamp_utc,elapsed_s,rss_kb,goroutines,open_fds,pinned_bpf_maps,events_total,doctor_p99_ms" \
+            > "$SOAK_DIR/soak.csv"
+
+      # ── 4. launch kerno ──────────────────────────────────────────────────
+      - name: Start kerno daemon
+        run: |
+          ./kerno start \
+            --pprof-addr "127.0.0.1:${PPROF_PORT}" \
+            --metrics-addr "127.0.0.1:${METRICS_PORT}" \
+            > "$KERNO_LOG" 2>&1 &
+          echo "KERNO_PID=$!" >> "$GITHUB_ENV"
+
+          # Wait until the pprof endpoint is ready (up to 60 s)
+          echo "Waiting for pprof endpoint..."
+          for i in $(seq 1 60); do
+            if curl -sf "http://127.0.0.1:${PPROF_PORT}/debug/pprof/" > /dev/null 2>&1; then
+              echo "pprof ready after ${i}s"
+              break
+            fi
+            sleep 1
+          done
+
+      # ── 5. launch chaos ───────────────────────────────────────────────────
+      - name: Start chaos load
+        run: |
+          ./kerno chaos \
+            --induce cascade \
+            --duration "${DURATION}s" \
+            > "$CHAOS_LOG" 2>&1 &
+          echo "CHAOS_PID=$!" >> "$GITHUB_ENV"
+          echo "Chaos started, PID=$!"
+
+      # ── 6. soak watch loop ────────────────────────────────────────────────
+      - name: Run soak-watch
+        run: |
+          bash scripts/soak-watch.sh \
+            --pid         "$KERNO_PID" \
+            --duration    "$DURATION" \
+            --interval    "$INTERVAL" \
+            --pprof-port  "$PPROF_PORT" \
+            --metrics-port "$METRICS_PORT" \
+            --outdir      "$SOAK_DIR"
+
+      # ── 7. stop daemons ───────────────────────────────────────────────────
+      - name: Gracefully stop kerno and chaos
+        if: always()
+        run: |
+          kill "$KERNO_PID" 2>/dev/null || true
+          kill "$CHAOS_PID" 2>/dev/null || true
+          # Give them 10 s to exit cleanly
+          sleep 10
+          kill -9 "$KERNO_PID" 2>/dev/null || true
+          kill -9 "$CHAOS_PID" 2>/dev/null || true
+
+      # ── 8. copy logs into soak dir ────────────────────────────────────────
+      - name: Collect logs
+        if: always()
+        run: |
+          cp "$KERNO_LOG" "$SOAK_DIR/kerno.log" 2>/dev/null || true
+          cp "$CHAOS_LOG" "$SOAK_DIR/chaos.log" 2>/dev/null || true
+
+      # ── 9. assert pass criteria ───────────────────────────────────────────
+      - name: Assert pass criteria
+        run: |
+          python3 scripts/soak-assert.py "$SOAK_DIR/soak.csv"
+
+      # ── 10. upload evidence (always, even on failure) ─────────────────────
+      - name: Upload soak artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: soak-report-${{ github.run_id }}
+          path: /tmp/soak/
+          retention-days: 30
+
+      # ── 11. surface a badge-friendly summary ──────────────────────────────
+      - name: Write job summary
+        if: always()
+        run: |
+          python3 - <<'EOF'
+          import csv, sys, os
+
+          path = "/tmp/soak/soak.csv"
+          if not os.path.exists(path):
+              print("## Soak report\n\n❌ CSV not found — soak-watch may have crashed early.")
+              sys.exit(0)
+
+          rows = list(csv.DictReader(open(path)))
+          if len(rows) < 2:
+              print("## Soak report\n\n⚠️  Fewer than 2 data points collected.")
+              sys.exit(0)
+
+          first = rows[0]
+          last  = rows[-1]
+          rss_ratio = float(last['rss_kb']) / max(float(first['rss_kb']), 1)
+          gor_delta = int(last['goroutines']) - int(first['goroutines'])
+
+          print("## Soak report\n")
+          print(f"| Metric | Hour-1 baseline | Final | Change |")
+          print(f"|---|---|---|---|")
+          print(f"| RSS (KB)      | {first['rss_kb']}  | {last['rss_kb']}  | ×{rss_ratio:.2f} |")
+          print(f"| Goroutines    | {first['goroutines']} | {last['goroutines']} | +{gor_delta} |")
+          print(f"| Open FDs      | {first['open_fds']} | {last['open_fds']} | — |")
+          print(f"| Pinned BPF maps | {first['pinned_bpf_maps']} | {last['pinned_bpf_maps']} | — |")
+          print(f"| Events total  | {first['events_total']} | {last['events_total']} | — |")
+          print(f"\nSamples collected: {len(rows)}")
+          EOF
+          ) >> "$GITHUB_STEP_SUMMARY"
